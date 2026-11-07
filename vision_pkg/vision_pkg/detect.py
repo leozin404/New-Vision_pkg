@@ -20,7 +20,7 @@ from .submodules.utils          import draw_lines, position
 from .submodules.ClassConfig    import *
 from .submodules.Client         import Client
 from .submodules.ImageGetter    import ImageGetter
-from .submodules.image          import findBall, findGoalpost, resize_image
+from .submodules.image          import findBall, findGoalpost, resize_image, findL, findX, findT, findElipse
 
 
 class BallDetection(Node):
@@ -39,10 +39,24 @@ class BallDetection(Node):
         self.declare_parameter("device", "cpu")
         self.device = self.get_parameter("device").get_parameter_value().string_value
 
-        self.declare_parameter("model", f"{os.path.dirname(os.path.realpath(__file__))}/weights/best_openvino_model/")
+        #self.declare_parameter("model", f"{os.path.dirname(os.path.realpath(__file__))}/weights/best_openvino_model/")
+        #self.declare_parameter("model", f"{os.path.dirname(os.path.realpath(__file__))}/weights/LTX.pt") # Dataset com Landmarks
+        self.declare_parameter("model", f"{os.path.dirname(os.path.realpath(__file__))}/weights/LTXv2.pt") # Dataset com Landmarks - setembro26
+
         self.model = YOLO(self.get_parameter("model").get_parameter_value().string_value) # Load model
         self.value_classes = self.get_classes()  # define antes de usar
         self.get_logger().info(f"CLASSES DO MODELO: {self.value_classes}")
+
+        # Thresholds da inferência
+        self.declare_parameter("conf", 0.5)
+        self.conf = self.get_parameter("conf").get_parameter_value().double_value
+
+        self.declare_parameter("max_det", 13)
+        self.max_det = self.get_parameter("max_det").get_parameter_value().integer_value
+
+        # DEBUG: imprime todas as detecções cruas da rede a cada frame
+        self.declare_parameter("debug_detections", False)
+        self.debug_detections = self.get_parameter("debug_detections").get_parameter_value().bool_value
 
         self.declare_parameter("img_qlty", 100) 
         self.img_qlty = self.get_parameter("img_qlty").get_parameter_value().integer_value
@@ -74,22 +88,44 @@ class BallDetection(Node):
         # derived dims
         self.original_dim = np.array([self.img_width, self.img_height])
         self.redued_dim = self.original_dim * self.img_qlty / 100
-        self.value_classes = self.get_classes()
         
         self.bridge = CvBridge()
 
         # Publishers (same as original)
         self.ball_position_publisher_ = self.create_publisher(Vision, '/ball_position', 2)
         self.goalpost_position_publisher_ = self.create_publisher(Vision, '/goalpost_position', 10)
+        self.goal_center_position_publisher = self.create_publisher(Vision, '/goal_center_position', 10)
         self.goalpost_px_position_publisher_ = self.create_publisher(Point2D, '/goalpost_px_position', 2)
         self.ball_px_position_publisher_ = self.create_publisher(Point2D, '/ball_px_position', 2)
         self.goalpost_center_publisher_ = self.create_publisher(Point2D, '/goalpost_center_px', 2)
         self.goalpost_count_publisher_ = self.create_publisher(Int32, '/goalpost_count', 2)
-        self.goalcenter_position_publisher = self.create_publisher(Vision, 'goal_center_position', 2)
+
+        # Landmarks L, T, X
+        self.l_position_publisher_ = self.create_publisher(Vision, '/l_position', 10)
+        self.l_px_position_publisher_ = self.create_publisher(Point2D, '/l_px_position', 2)
+        self.l_count_publisher_ = self.create_publisher(Int32, '/l_count', 2)
+
+        self.t_position_publisher_ = self.create_publisher(Vision, '/t_position', 10)
+        self.t_px_position_publisher_ = self.create_publisher(Point2D, '/t_px_position', 2)
+        self.t_count_publisher_ = self.create_publisher(Int32, '/t_count', 2)
+
+        self.x_position_publisher_ = self.create_publisher(Vision, '/x_position', 10)
+        self.x_px_position_publisher_ = self.create_publisher(Point2D, '/x_px_position', 2)
+        self.x_count_publisher_ = self.create_publisher(Int32, '/x_count', 2)
+        
+        # Elipse (círculo central)
+        self.elipse_position_publisher_ = self.create_publisher(Vision, '/elipse_position', 10)
+        self.elipse_px_position_publisher_ = self.create_publisher(Point2D, '/elipse_px_position', 2)
+        self.elipse_count_publisher_ = self.create_publisher(Int32, '/elipse_count', 2) 
 
         # state vars
         self.cont_real_ball_detections = 0
         self.cont_real_goalpost_detections = 0
+
+        self.cont_real_l_detections = 0
+        self.cont_real_t_detections = 0
+        self.cont_real_x_detections = 0
+        self.cont_real_elipse_detections = 0
 
         self.kick_ready_streak = 0
         self.kick_fail_tolerance = 0
@@ -104,16 +140,16 @@ class BallDetection(Node):
         self.results = None
         self.img = None
 
-        self.goal_center = Vision()
-
-        self.last_goal_detection = time.time()
-        self.goal_detected = False
-
         self.ball_pos = position() #apagar
         self.filtered_ball_position = Point2D()
 
         self.ball_pos_area = Vision()
         self.goalpost_pos_area = Vision()
+
+        self.l_pos_area = Vision()
+        self.t_pos_area = Vision()
+        self.x_pos_area = Vision()
+        self.elipse_pos_area = Vision()
         
         self.cont_real_detections = 0
 
@@ -159,7 +195,7 @@ class BallDetection(Node):
     def get_classes(self): #function for list all classes and the respective number in a dictionary
         classes = self.model.names
         value_classes = {value: key for key, value in classes.items()}
-        return value_classes       
+        return value_classes   
 
     def timer_callback(self):
         # Read frame from OpenCV
@@ -172,19 +208,30 @@ class BallDetection(Node):
             self.get_logger().warn("Falha ao ler frame da câmera.")
             return
 
-        # emulate receiving a sensor_msgs/Image if other parts expect it: we process the cv image directly
         try:
             if self.get_image:
                 self.imageGetter.save(frame)
 
-            # predict & process
-            self.results = self.predict_image(resize_image(frame, self.img_qlty))  # predict image
+            # predict & process (uma única inferência por frame)
+            self.results = self.predict_image(resize_image(frame, self.img_qlty))
+
+            # DEBUG: tudo que a rede detectou, antes de qualquer filtro
+            if self.debug_detections:
+                for b in self.results.boxes:
+                    c = int(b.cls)
+                    self.get_logger().info(
+                        f"{self.results.names[c]} conf={float(b.conf):.2f} xyxy={b.xyxy.tolist()}"
+                    )
 
             if self.show_divisions:
                 frame = draw_lines(frame, self.config)  # Draw camera divisions
 
             frame = self.ball_detection(frame, self.results)
             frame = self.goalpost_detection(frame, self.results)
+            frame = self.l_detection(frame, self.results)
+            frame = self.t_detection(frame, self.results)
+            frame = self.x_detection(frame, self.results)
+            frame = self.elipse_detection(frame, self.results)
 
             try:
                 # The original code checks filtered_ball_position.size != 0 — keep similar behavior.
@@ -200,7 +247,7 @@ class BallDetection(Node):
                 except Exception:
                     self.get_logger().debug("Não está publicando no servidor udp")
 
-            # Show
+            #Show - DEBUG CÂMERA
             cv2.imshow('Ball', frame)
             cv2.waitKey(1)
 
@@ -215,37 +262,24 @@ class BallDetection(Node):
             self.get_logger().error(f"Erro no timer_callback: {str(e)}")
 
     def predict_image(self, img):
-        results = self.model(img, device=self.device, conf=0.4, max_det=10, verbose=False)        
+        results = self.model(img, device=self.device, conf=self.conf, max_det=self.max_det, verbose=False)        
         return results[0]
 
     def goalpost_detection(self, img, results):
         img_cp = img.copy()
-        
 
         try:
             img_cp, goalpost_px_positions = findGoalpost(img_cp, results, self.value_classes)
 
-
             if not goalpost_px_positions or len(goalpost_px_positions) == 0: # se a trave nn for detectada
-
                 goalpost_area = Vision()
                 goalpost_area.detected = False
-
                 self.goalpost_position_publisher_.publish(goalpost_area)
                 self.goalpost_px_positions_for_decision = []  # ISSO É OBRIGATÓRIO
 
                 goalpost_count_msg = Int32()
                 goalpost_count_msg.data = 0
                 self.goalpost_count_publisher_.publish(goalpost_count_msg)
-
-                if self.goal_detected and time.time() - self.last_goal_detection >= 2:
-
-                    self.goal_center = Vision()
-                    self.goal_center.detected = False
-
-                    self.goalcenter_position_publisher.publish(self.goal_center)
-
-                    self.goal_detected = False
                 return img_cp
 
             # Publica cada trave detectada
@@ -262,7 +296,6 @@ class BallDetection(Node):
             goalpost_count_msg.data = len(goalpost_px_positions)
             self.goalpost_count_publisher_.publish(goalpost_count_msg)
 
-            
             # calcula o centro do gol se detectou pelo menos 2 traves
             if len(goalpost_px_positions) >= 2:
                 # Ordena traves pela posição x (esquerda para direita)
@@ -274,34 +307,24 @@ class BallDetection(Node):
                 center_x = (left_post[0] + right_post[0]) / 2
                 center_y = (left_post[1] + right_post[1]) / 2
 
-                # Publica o centro do gol
+                self.get_logger().info(f"Centro do gol detectado X:{center_x}, Y:{center_y}")
+
+                #publica o centro do gol como vision para neck control
+                goal_center = Vision()
+                goal_center.detected = False
+                self.goal_center_position_publisher.publish(goal_center)
+
                 center_goalpost_msg = Point2D()
                 center_goalpost_msg.x = float(center_x)
                 center_goalpost_msg.y = float(center_y)
+
+                # Publica o centro do gol
                 self.goalpost_center_publisher_.publish(center_goalpost_msg)
-
-                self.goal_center_pos = self.goal_center_area(center_goalpost_msg)
-
-                self.last_goal_detection = time.time()
-                self.goal_detected = True
-
-                self.goalcenter_position_publisher.publish(self.goal_center_pos)
-
 
                 self.goalpost_px_positions_for_decision = goalpost_px_positions  # salva para decisão
 
                 # Desenha o centro do gol na imagem
                 cv2.circle(img_cp, (int(center_x), int(center_y)), 8, (0, 0, 255), -1)  # vermelho
-            
-            if self.goal_detected and time.time() - self.last_goal_detection >= 2:
-                self.goal_center = Vision()
-                self.goal_center.detected = False
-
-                self.goalcenter_position_publisher.publish(self.goal_center)
-
-                self.goal_detected = False
-
-                
 
         except Exception as e:
             self.get_logger().error(f"Erro na goalpost_detection: {str(e)}")
@@ -324,16 +347,151 @@ class BallDetection(Node):
                 self.ball_px_position_publisher_.publish(ball_px_pos_msg)
                 new_ball_pos_area = self.get_ball_pos_area(ball_px_pos)
 
-                if len(goalpost_px_positions) >= 2:
-
-                    cv2.lines(img_cp, (int(center_x), int(center_y)), (float(ball_px_pos[0]), float(ball_px_pos[1])), (0, 255, 0), 2) #desenha uma linha entre a bola e o gol
-                    
                 self.filtered_ball_position = ball_px_pos  # salva a posição filtrada da bola
         except Exception:
             # fallback: if findBall returns None or similar
             pass
-
+        
         self.ball_pos_area_filter(new_ball_pos_area, 1)
+        return img_cp
+
+    def l_detection(self, img, results):
+        img_cp = img.copy()
+        try:
+            img_cp, l_px_positions = findL(img_cp, results, self.value_classes)
+            
+            if not l_px_positions or len(l_px_positions) == 0:
+                l_area = Vision()
+                l_area.detected = False
+                self.l_position_publisher_.publish(l_area)
+                
+                l_count_msg = Int32()
+                l_count_msg.data = 0
+                self.l_count_publisher_.publish(l_count_msg)
+                return img_cp
+            
+            # Publica cada L detectado
+            for l_px_pos in l_px_positions:
+                l_px_pos_msg = Point2D()
+                l_px_pos_msg.x = float(l_px_pos[0])
+                l_px_pos_msg.y = float(l_px_pos[1])
+                self.l_px_position_publisher_.publish(l_px_pos_msg)
+                
+                new_l_pos_area = self.get_landmark_pos_area(l_px_pos)  # Reutiliza função genérica
+                self.l_pos_area_filter(new_l_pos_area, 1)
+            
+            l_count_msg = Int32()
+            l_count_msg.data = len(l_px_positions)
+            self.l_count_publisher_.publish(l_count_msg)
+            
+        except Exception as e:
+            self.get_logger().error(f"Erro na l_detection: {str(e)}")
+        
+        return img_cp
+
+    def t_detection(self, img, results):
+        img_cp = img.copy()
+        
+        try:
+            img_cp, t_px_positions = findT(img_cp, results, self.value_classes)
+            
+            if not t_px_positions or len(t_px_positions) == 0:
+                t_area = Vision()
+                t_area.detected = False
+                self.t_position_publisher_.publish(t_area)
+                
+                t_count_msg = Int32()
+                t_count_msg.data = 0
+                self.t_count_publisher_.publish(t_count_msg)
+                return img_cp
+            
+            # Publica cada T detectado
+            for t_px_pos in t_px_positions:
+                t_px_pos_msg = Point2D()
+                t_px_pos_msg.x = float(t_px_pos[0])
+                t_px_pos_msg.y = float(t_px_pos[1])
+                self.t_px_position_publisher_.publish(t_px_pos_msg)
+                
+                new_t_pos_area = self.get_landmark_pos_area(t_px_pos)  # Reutiliza função genérica
+                self.t_pos_area_filter(new_t_pos_area, 1)
+            
+            t_count_msg = Int32()
+            t_count_msg.data = len(t_px_positions)
+            self.t_count_publisher_.publish(t_count_msg)
+            
+        except Exception as e:
+            self.get_logger().error(f"Erro na t_detection: {str(e)}")
+        
+        return img_cp
+      
+    def x_detection(self, img, results):
+        img_cp = img.copy()
+        
+        try:
+            img_cp, x_px_positions = findX(img_cp, results, self.value_classes)
+            
+            if not x_px_positions or len(x_px_positions) == 0:
+                x_area = Vision()
+                x_area.detected = False
+                self.x_position_publisher_.publish(x_area)
+                
+                x_count_msg = Int32()
+                x_count_msg.data = 0
+                self.x_count_publisher_.publish(x_count_msg)
+                return img_cp
+            
+            # Publica cada X detectado
+            for x_px_pos in x_px_positions:
+                x_px_pos_msg = Point2D()
+                x_px_pos_msg.x = float(x_px_pos[0])
+                x_px_pos_msg.y = float(x_px_pos[1])
+                self.x_px_position_publisher_.publish(x_px_pos_msg)
+                
+                new_x_pos_area = self.get_landmark_pos_area(x_px_pos)  # Reutiliza função genérica
+                self.x_pos_area_filter(new_x_pos_area, 1)
+            
+            x_count_msg = Int32()
+            x_count_msg.data = len(x_px_positions)
+            self.x_count_publisher_.publish(x_count_msg)
+            
+        except Exception as e:
+            self.get_logger().error(f"Erro na x_detection: {str(e)}")
+        
+        return img_cp
+
+    def elipse_detection(self, img, results):
+        img_cp = img.copy()
+    
+        try:
+            img_cp, elipse_px_positions = findElipse(img_cp, results, self.value_classes)
+        
+            if not elipse_px_positions or len(elipse_px_positions) == 0:
+                elipse_area = Vision()
+                elipse_area.detected = False
+                self.elipse_position_publisher_.publish(elipse_area)
+            
+                elipse_count_msg = Int32()
+                elipse_count_msg.data = 0
+                self.elipse_count_publisher_.publish(elipse_count_msg)
+                return img_cp
+        
+            # Publica cada elipse detectada
+            for elipse_px_pos in elipse_px_positions:
+                elipse_px_pos_msg = Point2D()
+                elipse_px_pos_msg.x = float(elipse_px_pos[0])
+                elipse_px_pos_msg.y = float(elipse_px_pos[1])
+                self.elipse_px_position_publisher_.publish(elipse_px_pos_msg)
+                
+                new_elipse_pos_area = self.get_landmark_pos_area(elipse_px_pos)  # Reutiliza função genérica
+                self.elipse_pos_area_filter(new_elipse_pos_area, 1)
+            
+            elipse_count_msg = Int32()
+            elipse_count_msg.data = len(elipse_px_positions)
+            self.elipse_count_publisher_.publish(elipse_count_msg)
+        
+        except Exception as e:
+            self.get_logger().error(f"Erro na elipse_detection: {str(e)}")
+    
         return img_cp
 
     def ball_px_position_filter(self, not_filtered_ball_pos, opt):
@@ -374,25 +532,61 @@ class BallDetection(Node):
             if self.cont_real_goalpost_detections > 2:
                 self.goalpost_position_publisher_.publish(self.goalpost_pos_area)
 
-    
-    def goal_center_area(self, center_goalpost_msg):
-        goal_center = Vision()
+    def l_pos_area_filter(self, not_filtered_l_pos, opt):
+        if opt == 0:
+            self.l_pos_area = not_filtered_l_pos
         
-        goal_center.detected = True
+        elif opt == 1:
+            if not_filtered_l_pos == self.l_pos_area:
+                self.cont_real_l_detections += 1
+            else:
+                self.cont_real_l_detections = 0
+                self.l_pos_area = not_filtered_l_pos
+            
+            if self.cont_real_l_detections > 2:
+                self.l_position_publisher_.publish(self.l_pos_area)
 
-        if center_goalpost_msg.x <= self.config.x_left:
-            goal_center.left = True
+    def t_pos_area_filter(self, not_filtered_t_pos, opt):
+        if opt == 0:
+            self.t_pos_area = not_filtered_t_pos
+        
+        elif opt == 1:
+            if not_filtered_t_pos == self.t_pos_area:
+                self.cont_real_t_detections += 1
+            else:
+                self.cont_real_t_detections = 0
+                self.t_pos_area = not_filtered_t_pos
+            
+            if self.cont_real_t_detections > 2:
+                self.t_position_publisher_.publish(self.t_pos_area)
 
-        elif center_goalpost_msg.x < (self.config.x_center - 100):
-            goal_center.center = True
+    def x_pos_area_filter(self, not_filtered_x_pos, opt):
+        if opt == 0:
+            self.x_pos_area = not_filtered_x_pos
+        
+        elif opt == 1:
+            if not_filtered_x_pos == self.x_pos_area:
+                self.cont_real_x_detections += 1
+            else:
+                self.cont_real_x_detections = 0
+                self.x_pos_area = not_filtered_x_pos
+            
+            if self.cont_real_x_detections > 2:
+                self.x_position_publisher_.publish(self.x_pos_area)
 
-        else:
-            goal_center.right = True
-
-        if center_goalpost_msg.y > 0:
-            goal_center.med = True
-
-        return goal_center
+    def elipse_pos_area_filter(self, not_filtered_elipse_pos, opt):
+        if opt == 0:
+            self.elipse_pos_area = not_filtered_elipse_pos
+        
+        elif opt == 1:
+            if not_filtered_elipse_pos == self.elipse_pos_area:
+                self.cont_real_elipse_detections += 1
+            else:
+                self.cont_real_elipse_detections = 0
+                self.elipse_pos_area = not_filtered_elipse_pos
+            
+            if self.cont_real_elipse_detections > 2:
+                self.elipse_position_publisher_.publish(self.elipse_pos_area)
 
     def get_ball_pos_area(self, ball_px_pos):
         ball_pos = Vision()
@@ -465,6 +659,32 @@ class BallDetection(Node):
 
         return goalpost_pos
     
+    def get_landmark_pos_area(self, landmark_px_pos):
+        """Reutilizável para L, T, X e Elipse"""
+        landmark_pos = Vision()
+        landmark_pos.detected = True
+        
+        x = landmark_px_pos[0]
+        y = landmark_px_pos[1]
+        
+        # Classificação horizontal
+        if x < self.config.x_left:
+            landmark_pos.left = True
+        elif x > self.config.x_center:
+            landmark_pos.right = True
+        else:
+            landmark_pos.center = True
+        
+        # Classificação vertical
+        if y < self.config.y_longe:
+            landmark_pos.far = True
+        elif y > self.config.y_chute:
+            landmark_pos.close = True
+        else:
+            landmark_pos.med = True
+        
+        return landmark_pos
+
     def ball_delta_position_threshold(self, new_position, threshold):
         dp = position()
         dp.x = abs(new_position.x - self.ball_pos.x)
