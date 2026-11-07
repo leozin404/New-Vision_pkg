@@ -128,33 +128,90 @@ def drawXBox(img, results, x_indices):
     
     return img_cp, x_positions
 
-def drawElipseBox(img, results, elipse_indices):
-    """Desenha a elipse do círculo central - COR CIANO"""
+class BoxSmoother:
+    """Suaviza uma bounding box ao longo dos frames. Usado só para o desenho,
+    não altera o que é publicado nos tópicos."""
+
+    def __init__(self, alpha=0.4, hold_frames=5):
+        self.alpha = alpha              # 0..1, maior = segue mais rápido
+        self.hold_frames = hold_frames  # quantos frames mantém a box se a detecção piscar
+        self.box = None                 # [cx, cy, w, h] em pixels
+        self.missed = 0
+
+    def update(self, box):
+        if box is None:
+            self.missed += 1
+            if self.missed > self.hold_frames:
+                self.box = None
+            return self.box
+
+        box = np.asarray(box, dtype=float)
+        if self.box is None:
+            self.box = box
+        else:
+            # Se pulou muito, reinicia em vez de "arrastar" a box pela tela
+            jump = np.hypot(box[0] - self.box[0], box[1] - self.box[1])
+            if jump > 0.5 * max(self.box[2], self.box[3]):
+                self.box = box
+            else:
+                self.box = self.alpha * box + (1 - self.alpha) * self.box
+
+        self.missed = 0
+        return self.box
+
+def _box_px(results, idx, img):
+    """Retorna (cx, cy, w, h) em pixels da imagem de saída."""
+    cx, cy, w, h = np.reshape(results.boxes[idx].xywhn.numpy(), -1)
+    return (float(cx * img.shape[1]), float(cy * img.shape[0]),
+            float(w * img.shape[1]), float(h * img.shape[0]))
+
+def _touches_edge(x1, y1, x2, y2, img, margin=3):
+    h, w = img.shape[:2]
+    return x1 <= margin or y1 <= margin or x2 >= w - 1 - margin or y2 >= h - 1 - margin
+
+def _draw_corner_box(img, x1, y1, x2, y2, color, thickness=2, frac=0.2):
+    """Desenha só os cantos da box (mais limpo que o retângulo inteiro)."""
+    lx = max(int((x2 - x1) * frac), 4)
+    ly = max(int((y2 - y1) * frac), 4)
+    for px, py, dx, dy in [(x1, y1, 1, 1), (x2, y1, -1, 1), (x1, y2, 1, -1), (x2, y2, -1, -1)]:
+        cv2.line(img, (px, py), (px + dx * lx, py), color, thickness, cv2.LINE_AA)
+        cv2.line(img, (px, py), (px, py + dy * ly), color, thickness, cv2.LINE_AA)
+
+def drawElipseBox(img, results, elipse_indices, smoother=None):
+    """Desenha a elipse do círculo central - COR CIANO.
+    Elipse inteira na imagem: desenha a elipse.
+    Elipse cortada pela borda: desenha só os cantos da box."""
     img_cp = img.copy()
     elipse_positions = []
-    
+    color = (255, 255, 0)
+
+    best_idx, best_conf = None, -1.0
     for idx in elipse_indices:
-        elipse_box_xywh = results.boxes[idx].xywhn.numpy()
-        array_box_xywh = np.reshape(elipse_box_xywh, -1)
-        
-        center_x = int(array_box_xywh[0] * img.shape[1])
-        center_y = int(array_box_xywh[1] * img.shape[0])
-        width = int(array_box_xywh[2] * img.shape[1])
-        height = int(array_box_xywh[3] * img.shape[0])
-        
-        x1 = int(center_x - width / 2)
-        y1 = int(center_y - height / 2)
-        x2 = int(center_x + width / 2)
-        y2 = int(center_y + height / 2)
-        
-        # CIANO (255, 255, 0): bounding box + elipse inscrita
-        cv2.rectangle(img_cp, (x1, y1), (x2, y2), (255, 255, 0), 1)
-        cv2.ellipse(img_cp, (center_x, center_y), (max(width // 2, 1), max(height // 2, 1)),
-                    0, 0, 360, (255, 255, 0), 2)
-        cv2.circle(img_cp, (center_x, center_y), 5, (255, 255, 0), -1)
-        
-        elipse_positions.append(np.array([center_x, center_y], dtype=float))
-    
+        cx, cy, w, h = _box_px(results, idx, img)
+        elipse_positions.append(np.array([cx, cy], dtype=float))
+
+        conf = float(results.boxes[idx].conf)
+        if conf > best_conf:
+            best_idx, best_conf = idx, conf
+
+    raw = _box_px(results, best_idx, img) if best_idx is not None else None
+    shown = smoother.update(raw) if smoother is not None else raw
+
+    if shown is None:
+        return img_cp, elipse_positions
+
+    cx, cy, w, h = shown
+    x1, y1 = int(cx - w / 2), int(cy - h / 2)
+    x2, y2 = int(cx + w / 2), int(cy + h / 2)
+
+    if _touches_edge(x1, y1, x2, y2, img):
+        _draw_corner_box(img_cp, x1, y1, x2, y2, color)
+    else:
+        cv2.ellipse(img_cp, (int(cx), int(cy)), (max(int(w / 2), 1), max(int(h / 2), 1)),
+                    0, 0, 360, color, 2, cv2.LINE_AA)
+
+    cv2.circle(img_cp, (int(cx), int(cy)), 3, color, -1, cv2.LINE_AA)
+
     return img_cp, elipse_positions
 
 def resize_image(img, scale_percent=100):
@@ -222,7 +279,7 @@ def findX(img, results, classesValues):
     img_cp, x_positions = drawXBox(img_cp, results, x_indices)
     return img_cp, x_positions
 
-def findElipse(img, results, classesValues):
+def findElipse(img, results, classesValues, smoother=None):
     img_cp = img.copy()
 
     # Busca a classe sem diferenciar maiúscula/minúscula ('Elipse', 'elipse', ...)
@@ -233,5 +290,5 @@ def findElipse(img, results, classesValues):
     else:
         elipse_indices = np.where(results.boxes.cls == classesValues[key])[0]
     
-    img_cp, elipse_positions = drawElipseBox(img_cp, results, elipse_indices)
+    img_cp, elipse_positions = drawElipseBox(img_cp, results, elipse_indices, smoother)
     return img_cp, elipse_positions
